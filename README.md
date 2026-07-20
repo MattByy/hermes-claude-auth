@@ -1,129 +1,380 @@
 # hermes-claude-auth
-Claude Code OAuth bypass for hermes-agent, use your Claude Code subscription (Max/Pro) with Hermes.
 
-## What this does
-Patches hermes-agent at runtime to pass Anthropic's server-side OAuth content validation. It does not modify hermes-agent source files. Installation happens through a Python import hook that monkey-patches `build_anthropic_kwargs` on startup.
+Use Hermes with your flat-fee Claude Code subscription instead of burning a normal Anthropic API key.
 
-## Why this exists
-On 2026-04-04, Anthropic added server-side validation that rejects OAuth requests from third-party tools. This patch adds the billing header signature and system prompt structure the API expects.
+This repo is a local patch layer for `hermes-agent`. It keeps Claude Code OAuth credentials fresh, makes Hermes requests look enough like official Claude Code requests for subscription routing, and repairs the common auth drift that kills long-running Hermes jobs.
 
-## Prerequisites
-- hermes-agent installed (`~/.hermes/hermes-agent/`)
-- Claude Code CLI authenticated (valid credentials at `~/.claude/.credentials.json`)
-- hermes-agent configured for OAuth (`credential_pool` has a `claude_code` entry in `~/.hermes/auth.json`)
-- Python 3.11+
+## The Problem
+
+Claude Code subscription auth is OAuth-based. The access token looks like:
+
+```text
+sk-ant-oat01-...
+```
+
+That token is short-lived. The important long-lived thing is the refresh token:
+
+```text
+sk-ant-ort01-...
+```
+
+Hermes can accidentally keep using an old access token from its environment, credential pool, or cached client. When that happens, a job that started fine suddenly dies with:
+
+```text
+HTTP 401: Invalid authentication credentials
+Please run /login
+```
+
+Running `/login` inside a broken Hermes session is not a real fix. It may refresh Claude Code, but Hermes can still hold the stale token in another place.
+
+This repo fixes that architecture.
+
+## What This Repo Does
+
+There are three pieces.
+
+### 1. Runtime Patch
+
+`anthropic_billing_bypass.py` is copied to:
+
+```text
+~/.hermes/patches/anthropic_billing_bypass.py
+```
+
+`sitecustomize_hook.py` is installed into the Hermes Python venv as:
+
+```text
+~/.hermes/hermes-agent/venv/lib/pythonX.Y/site-packages/sitecustomize.py
+```
+
+Python loads `sitecustomize.py` automatically when Hermes starts. That hook patches Hermes at runtime. It does not edit Hermes source files.
+
+The patch:
+
+- pulls the freshest Claude Code OAuth token from macOS Keychain or `~/.claude/.credentials.json`
+- refreshes expired Claude Code access tokens
+- ignores stale `ANTHROPIC_API_KEY`, `ANTHROPIC_TOKEN`, and `CLAUDE_CODE_OAUTH_TOKEN` when subscription-only mode is enabled
+- replaces stale Anthropic client tokens with the fresh Claude Code token
+- force-refreshes on HTTP 401, even if local `expiresAt` still claims the token is valid
+- prevents Hermes from marking the only `claude_code` pool entry as exhausted after a refreshable 401
+
+### 2. Claude Code Request Shape
+
+Anthropic validates that OAuth subscription requests look like official Claude Code traffic. The patch adds the compatibility bits Hermes is missing:
+
+- Claude Code billing header signature
+- Claude Code-ish Stainless SDK headers
+- OAuth beta flags
+- `?beta=true`
+- MCP tool name wrapping/unwrapping
+- tool-pair cleanup for orphaned `tool_use` / `tool_result`
+- small provider compatibility fixes for Haiku effort and Opus temperature
+
+In normal words: Hermes still does the work, but the outgoing Anthropic request is shaped like Claude Code expects.
+
+### 3. Hermes Doctor
+
+`scripts/hermes_doctor.py` installs as:
+
+```text
+~/.hermes/bin/hermes-doctor
+```
+
+It checks and repairs local drift:
+
+- mirrors the freshest Claude Code credential between Keychain and `~/.claude/.credentials.json`
+- clears stale `claude_code` pool exhaustion after a refreshable 401
+- sets noisy auxiliary tasks to `auto` so title/compression/web helpers do not use a separate stale Anthropic auth path
+- checks Claude login status
+- optionally runs real Claude and Hermes smoke tests
+- checks required gateways
+- disables unused legacy gateways if requested
+
+The doctor also installs a macOS LaunchAgent that runs a lightweight check every 5 minutes.
+
+## How Token Refresh Works
+
+Source of truth:
+
+```text
+macOS Keychain: Claude Code-credentials
+~/.claude/.credentials.json
+```
+
+Hermes runtime path:
+
+```text
+Hermes request
+  -> patched Anthropic adapter
+  -> resolve fresh Claude Code credential
+  -> refresh if expired
+  -> build Anthropic client with fresh access token
+  -> apply Claude Code request-shape patch
+  -> send request
+```
+
+Reactive 401 path:
+
+```text
+Anthropic returns 401
+  -> patch force-refreshes Claude Code OAuth using refresh token
+  -> writes fresh token pair back to Keychain / ~/.claude/.credentials.json
+  -> updates Hermes credential_pool claude_code entry
+  -> clears stale exhausted status
+  -> retries same credential instead of killing the task
+```
+
+That last part is the important fix. A valid-looking token can still be rejected server-side. So the patch trusts the server's 401 more than the local expiry timestamp.
 
 ## Install
+
+From the repo:
+
+```bash
+cd /Users/swello/Documents/hermes/hermes-claude-auth
+./install.sh
+./scripts/install_doctor.sh
+```
+
+Remote install:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kristianvast/hermes-claude-auth/main/install-remote.sh | bash
 ```
 
-Or clone manually:
-```bash
-git clone https://github.com/kristianvast/hermes-claude-auth.git
-cd hermes-claude-auth
-./install.sh
+On macOS, `install.sh` also mirrors the Claude Code Keychain credential into:
+
+```text
+~/.claude/.credentials.json
 ```
 
-What `install.sh` does:
-- Copies `anthropic_billing_bypass.py` to `~/.hermes/patches/`
-- Installs the import hook as `sitecustomize.py` in the hermes venv's site-packages
-- Restarts `hermes-gateway.service` if running
+Restart gateways after install:
+
+```bash
+hermes gateway restart
+hermes --profile dad gateway restart
+hermes --profile shared gateway restart
+```
+
+## Verify
+
+Real Claude smoke:
+
+```bash
+claude -p 'Reply exactly CLAUDE_OK' --model claude-sonnet-4-6 --output-format text
+```
+
+Full Hermes auth smoke:
+
+```bash
+~/.hermes/bin/hermes-doctor --profiles default dad shared --disable-unused
+```
+
+Fast local status:
+
+```bash
+~/.hermes/bin/hermes-doctor --profiles default dad shared --disable-unused --no-claude-smoke --no-hermes-smoke
+cat ~/.hermes/health/doctor-status.json
+```
+
+Gateway status:
+
+```bash
+hermes gateway list
+```
+
+Look for patch load messages:
+
+```bash
+tail -n 200 ~/.hermes/logs/gateway.error.log | rg 'anthropic_billing_bypass|Credential pool 401'
+```
+
+Expected messages include:
+
+```text
+[anthropic_billing_bypass] Token refresh hook installed
+[anthropic_billing_bypass] Credential pool 401 refresh hook installed
+[anthropic_billing_bypass] Bypass installed
+```
+
+## Subscription-Only Mode
+
+Default:
+
+```bash
+HERMES_CLAUDE_AUTH_STRICT_SUBSCRIPTION=1
+```
+
+In this mode, once refreshable Claude Code credentials exist, the patch ignores:
+
+```text
+ANTHROPIC_API_KEY
+ANTHROPIC_TOKEN
+CLAUDE_CODE_OAUTH_TOKEN
+```
+
+That is intentional. Otherwise an old shell or launchd environment variable can silently override the fresh Claude subscription token.
+
+To allow normal Anthropic API-key fallback again:
+
+```bash
+export HERMES_CLAUDE_AUTH_STRICT_SUBSCRIPTION=0
+```
+
+For this setup, leave it on.
+
+## Composio Tool Control
+
+Too many MCP tools can push Hermes into long-context billing/rate-limit trouble. This repo includes a helper:
+
+```bash
+~/.hermes/bin/hermes-composio-tools list
+~/.hermes/bin/hermes-composio-tools set gmail googlecalendar
+~/.hermes/bin/hermes-composio-tools add googledrive
+~/.hermes/bin/hermes-composio-tools remove googledrive
+```
+
+The `composio` management toolkit is always kept. Changes restart the default gateway unless `--no-restart` is passed.
+
+## Common Failures
+
+### `HTTP 401: Invalid authentication credentials`
+
+Run:
+
+```bash
+~/.hermes/bin/hermes-doctor --profiles default dad shared --disable-unused
+```
+
+If it says healthy, retry the Hermes job. The doctor probably repaired stale local state.
+
+If Claude itself fails:
+
+```bash
+claude auth login
+```
+
+Then:
+
+```bash
+~/.hermes/bin/hermes-doctor --profiles default dad shared --disable-unused
+hermes gateway restart
+```
+
+### Hermes says healthy, but one job still fails
+
+That usually means the job process cached an old client. Restart the gateway:
+
+```bash
+hermes gateway restart
+```
+
+If a worker is stuck:
+
+```bash
+ps -axo pid,ppid,etime,command | rg '[h]ermes.*kanban|[h]ermes.*gremlin|[h]ermes.*worker'
+```
+
+Kill the specific stuck worker, not everything.
+
+### Pool is stuck exhausted
+
+Check:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python - <<'PY'
+import json
+from hermes_cli.auth import read_credential_pool
+for e in read_credential_pool('anthropic') or []:
+    if e.get('source') == 'claude_code':
+        print(json.dumps({
+            'id': e.get('id'),
+            'last_status': e.get('last_status'),
+            'last_error_code': e.get('last_error_code'),
+            'has_access': bool(e.get('access_token')),
+            'has_refresh': bool(e.get('refresh_token')),
+            'expires_at_ms': e.get('expires_at_ms'),
+        }, indent=2))
+PY
+```
+
+If `last_status` is `exhausted` with `last_error_code` 401, run:
+
+```bash
+~/.hermes/bin/hermes-doctor --profiles default dad shared --disable-unused
+```
+
+The doctor now clears that state when Claude Code credentials are valid.
+
+### `HTTP 429: Usage credits are required for long context requests`
+
+This is usually not token refresh. It means the request got too large or routed into a paid/long-context path. Reduce tools/context:
+
+```bash
+~/.hermes/bin/hermes-composio-tools set gmail googlecalendar
+hermes gateway restart
+```
+
+### `HTTP 200: Overloaded`
+
+Anthropic is overloaded. The token is probably fine. Retry later or use a fallback provider if you actually configured one.
+
+## Files This Repo Touches
+
+| Path | Purpose |
+|---|---|
+| `~/.hermes/patches/anthropic_billing_bypass.py` | Runtime patch copied here |
+| `~/.hermes/hermes-agent/venv/.../sitecustomize.py` | Import hook that loads the patch |
+| `~/.claude/.credentials.json` | Claude Code credential mirror |
+| `~/.hermes/auth.json` | Hermes credential pool; doctor may clear stale `claude_code` 401 state |
+| `~/.hermes/bin/hermes-doctor` | Local repair/check command |
+| `~/Library/LaunchAgents/ai.hermes.doctor.plist` | macOS doctor monitor |
+
+Hermes source files are not modified.
+
+## Development
+
+Run tests with the Hermes venv:
+
+```bash
+cd /Users/swello/Documents/hermes/hermes-claude-auth
+~/.hermes/hermes-agent/venv/bin/python -m pytest -q
+```
+
+Install local changes:
+
+```bash
+./install.sh
+./scripts/install_doctor.sh
+```
 
 ## Uninstall
+
 ```bash
-./uninstall.sh          # remove hook only
-./uninstall.sh --purge  # remove hook + patch file
+./uninstall.sh
 ```
 
-## How it works
-1. **Billing header**: SHA-256 signed `x-anthropic-billing-header` injected as `system[0]`
-2. **System prompt relocation**: Non-identity system entries moved to the first user message as `<system-reminder>` blocks
-3. **Beta flags**: Adds `prompt-caching-scope-2026-01-05` and `advisor-tool-2026-03-01`
-4. **Stainless SDK spoof**: Lowercase `x-stainless-*` headers + `anthropic-dangerous-direct-browser-access` + `?beta=true` query param matching real Claude Code 2.1.112
-5. **Tool name namespacing**: Hermes's `mcp_bash` is rewritten to `mcp__hermes__Bash` outbound; the response normalizer unwraps it back to `bash` so hermes's tool dispatcher resolves the registered name without auto-repair noise
-6. **Tool pair repair**: Orphaned `tool_use` / `tool_result` blocks (left by long conversations or partial summaries) are stripped before signing — prevents HTTP 400 (upstream PR #136)
-7. **Haiku effort stripping**: `effort` parameter is removed for haiku models that reject it with HTTP 400 (upstream PR #126)
-8. **Temperature fix**: Strips non-default `temperature` on Opus 4.6 adaptive thinking, which otherwise rejects with HTTP 400
-9. **Account metadata**: Maps `~/.claude.json::oauthAccount.accountUuid` to `metadata.user_id` (Anthropic rejected the older `account_uuid` key with HTTP 400 on 2026-04-29)
+Remove patch file too:
 
-Installed through a `sitecustomize.py` MetaPathFinder hook, so it runs at interpreter startup with no source modifications.
+```bash
+./uninstall.sh --purge
+```
 
-## What gets modified
-| File | Action |
-|------|--------|
-| `~/.hermes/patches/anthropic_billing_bypass.py` | Created |
-| `<venv>/lib/pythonX.Y/site-packages/sitecustomize.py` | Created or replaced |
-| hermes-agent source files | NOT modified |
+Remove doctor:
 
-## Compatibility
-- Tested with hermes-agent on Python 3.11+
-- Linux and macOS
-- Depends on `build_anthropic_kwargs(is_oauth=...)` in `agent.anthropic_adapter`, so it may need updating if hermes-agent changes that interface
-
-## Troubleshooting
-
-### Install issues
-- **"hermes-agent not found"**: Make sure Hermes is installed at `~/.hermes/hermes-agent/`
-- **"No virtualenv found"**: Set `HERMES_VENV` to point to your venv
-- **Patch not loading**: Check `journalctl --user -u hermes-gateway -n 50` for `[anthropic_billing_bypass]` or `[hermes-claude-auth]` messages
-
-### Auth issues
-
-- **`Anthropic 401 authentication failed`** or **`No Anthropic credentials found`**: Hermes reads Claude subscription credentials from `~/.claude/.credentials.json`. If Claude Code is authenticated (e.g. in macOS Keychain) but that file is missing or stale, Hermes fails even when Claude Code itself works.
-
-  On macOS, `install.sh` v1.1.1+ auto-mirrors the `Claude Code-credentials` Keychain entry into `~/.claude/.credentials.json` on every run, so re-running the installer is usually enough. Full fix:
-
-  1. Refresh Claude subscription login:
-     ```bash
-     claude auth login --claudeai
-     ```
-  2. Re-run the installer to re-mirror credentials (macOS) and reload the patch:
-     ```bash
-     ./install.sh
-     ```
-  3. Remove stale `ANTHROPIC_TOKEN` / `ANTHROPIC_API_KEY` values from `~/.hermes/.env` — they can override subscription auth.
-  4. Reset cached credentials:
-     ```bash
-     hermes auth reset anthropic
-     ```
-  5. Retry with a smoke test:
-     ```bash
-     hermes chat -q 'Reply with exactly: AUTH TEST OK' --provider anthropic -m claude-sonnet-4-6 -Q
-     ```
-
-  If the auto-mirror doesn't work (e.g. your Keychain entry is under a different service name), mirror it manually:
-  ```bash
-  python3 - <<'PY'
-  import subprocess
-  from pathlib import Path
-
-  secret = subprocess.check_output(
-      ['security', 'find-generic-password', '-s', 'Claude Code-credentials', '-w'],
-      text=True,
-  ).strip()
-
-  cred_path = Path.home() / '.claude' / '.credentials.json'
-  cred_path.parent.mkdir(parents=True, exist_ok=True)
-  cred_path.write_text(secret)
-  cred_path.chmod(0o600)
-  print(f'wrote {cred_path}')
-  PY
-  ```
-
-  Credit: the macOS Keychain mirror approach was written up by [@DrQbz](https://github.com/DrQbz) in [issue #5](https://github.com/kristianvast/hermes-claude-auth/issues/5) and is now automated in `install.sh`.
-
-### Billing / routing issues
-
-- **HTTP 400: "Third-party apps now draw from your extra usage, not your plan limits"**: Anthropic's server-side validation has classified your requests as third-party and routed them to pay-per-token credits instead of your Max/Pro plan. Make sure you're on the latest version of this patch (it tracks the upstream [opencode-claude-auth](https://github.com/griffinmartin/opencode-claude-auth) fingerprint changes). Reinstall with `./install.sh` and restart `hermes-gateway`. If the error persists after update, the bypass is currently broken upstream too — track [issue #6](https://github.com/kristianvast/hermes-claude-auth/issues/6) for status.
-- **HTTP 400 persists after update**: The billing salt or signature format may have been rotated by Anthropic again. Check for newer commits to this repo.
+```bash
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/ai.hermes.doctor.plist
+rm -f ~/Library/LaunchAgents/ai.hermes.doctor.plist
+rm -f ~/.hermes/bin/hermes-doctor
+```
 
 ## Credits
-- [griffinmartin/opencode-claude-auth](https://github.com/griffinmartin/opencode-claude-auth), the original TypeScript implementation for opencode (MIT)
-- [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), the AI agent this patches (MIT)
+
+- [griffinmartin/opencode-claude-auth](https://github.com/griffinmartin/opencode-claude-auth)
+- [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)
 
 ## Disclaimer
-This uses Claude Code subscription credentials outside the official Claude Code CLI. It works with Anthropic's current OAuth implementation but may break if Anthropic changes their validation. Use at your own risk.
 
-## License
-MIT, see [LICENSE](LICENSE).
+This uses Claude Code subscription credentials outside the official Claude Code CLI. Anthropic can change this behavior. If they do, this patch may break.
+
+MIT license.

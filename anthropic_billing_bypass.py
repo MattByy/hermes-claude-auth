@@ -11,6 +11,9 @@ ports its bypass behaviors to Python.
 
 Version history
 ---------------
+- 1.6.0 (2026-06-16): Prefer refreshable Claude Code credentials over static
+  Anthropic env/auth.json tokens, refresh expired access tokens at runtime, and
+  add subscription-only env scrubbing.
 - 1.5.0 (2026-05-06): Fix literal ``\\n`` escapes in system-reminder text,
   lowercase Stainless headers (matches upstream JS SDK), restore Opus 4.6
   temperature stripping, port ``repair_tool_pairs`` (upstream PR #136) and
@@ -37,7 +40,7 @@ References
 
 from __future__ import annotations
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 import hashlib
 import inspect
@@ -45,9 +48,15 @@ import json
 import logging
 import os
 import platform
+import subprocess
 import sys
+import time
 import traceback
-from typing import Any, Dict, List, Set
+import urllib.parse
+import urllib.request
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger("anthropic_billing_bypass")
 
@@ -87,6 +96,526 @@ _EXTRA_OAUTH_BETAS = [
     "prompt-caching-scope-2026-01-05",
     "advisor-tool-2026-03-01",
 ]
+
+_STATIC_ANTHROPIC_ENV_VARS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+)
+_ANTHROPIC_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+_CLAUDE_CODE_REFRESH_UA_VERSION = "2.1.112"
+
+
+# ---------------------------------------------------------------------------
+# Refreshable Claude Code OAuth token resolution
+# ---------------------------------------------------------------------------
+
+
+def _strict_subscription_mode() -> bool:
+    """Default to subscription-only auth for this patch.
+
+    Set ``HERMES_CLAUDE_AUTH_STRICT_SUBSCRIPTION=0`` to preserve Hermes's
+    normal API-key fallback behavior.
+    """
+    value = os.environ.get("HERMES_CLAUDE_AUTH_STRICT_SUBSCRIPTION", "1")
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _is_oauth_like_token(token: Any) -> bool:
+    if not isinstance(token, str) or not token:
+        return False
+    if token.startswith("sk-ant-api"):
+        return False
+    return token.startswith(("sk-ant-", "eyJ", "cc-"))
+
+
+def _is_direct_anthropic_endpoint(base_url: Any) -> bool:
+    if not base_url:
+        return True
+    normalized = str(base_url).strip().rstrip("/").lower()
+    return not normalized or "anthropic.com" in normalized
+
+
+def _credential_access_token(creds: Any) -> str:
+    if not isinstance(creds, dict):
+        return ""
+    token = creds.get("accessToken") or creds.get("access_token") or ""
+    return token.strip() if isinstance(token, str) else ""
+
+
+def _credential_refresh_token(creds: Any) -> str:
+    if not isinstance(creds, dict):
+        return ""
+    token = creds.get("refreshToken") or creds.get("refresh_token") or ""
+    return token.strip() if isinstance(token, str) else ""
+
+
+def _credential_expires_at_ms(creds: Any) -> int:
+    if not isinstance(creds, dict):
+        return 0
+    raw = creds.get("expiresAt") or creds.get("expires_at_ms") or 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _credential_is_valid(creds: Any) -> bool:
+    token = _credential_access_token(creds)
+    if not token:
+        return False
+    expires_at_ms = _credential_expires_at_ms(creds)
+    if not expires_at_ms:
+        return True
+    return int(time.time() * 1000) < (expires_at_ms - 60_000)
+
+
+def _parse_claude_code_credentials_payload(raw: str, source: str) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            data = json.loads(bytes.fromhex(raw.strip()).decode())
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+    oauth_data = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    if not isinstance(oauth_data, dict):
+        return None
+    access_token = oauth_data.get("accessToken")
+    if not isinstance(access_token, str) or not access_token:
+        return None
+    return {
+        "accessToken": access_token,
+        "refreshToken": oauth_data.get("refreshToken", ""),
+        "expiresAt": oauth_data.get("expiresAt", 0),
+        "scopes": oauth_data.get("scopes", []),
+        "source": source,
+    }
+
+
+def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
+    if platform.system() != "Darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_claude_code_credentials_payload(
+        result.stdout.strip(), "macos_keychain"
+    )
+
+
+def _read_claude_code_credentials_file() -> Optional[Dict[str, Any]]:
+    path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        return _parse_claude_code_credentials_payload(
+            path.read_text(encoding="utf-8"), "claude_code_credentials_file"
+        )
+    except OSError:
+        return None
+
+
+def _read_local_claude_code_credentials() -> Optional[Dict[str, Any]]:
+    candidates = [
+        creds
+        for creds in (
+            _read_claude_code_credentials_from_keychain(),
+            _read_claude_code_credentials_file(),
+        )
+        if creds
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda creds: (
+            _credential_expires_at_ms(creds),
+            bool(_credential_refresh_token(creds)),
+        ),
+    )
+
+
+def _refresh_anthropic_oauth_token(refresh_token: str) -> Optional[Dict[str, Any]]:
+    if not refresh_token:
+        return None
+
+    data = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": _ANTHROPIC_OAUTH_CLIENT_ID,
+    }).encode()
+    endpoints = (
+        "https://platform.claude.com/v1/oauth/token",
+        "https://console.anthropic.com/v1/oauth/token",
+    )
+    for endpoint in endpoints:
+        req = urllib.request.Request(
+            endpoint,
+            data=data,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": (
+                    f"claude-cli/{_CLAUDE_CODE_REFRESH_UA_VERSION} (external, cli)"
+                ),
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode())
+        except Exception as exc:
+            logger.debug("Claude Code OAuth refresh failed at %s: %s", endpoint, exc)
+            continue
+
+        access_token = payload.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            continue
+        expires_in = payload.get("expires_in", 3600)
+        try:
+            expires_in = int(expires_in)
+        except (TypeError, ValueError):
+            expires_in = 3600
+        return {
+            "accessToken": access_token,
+            "refreshToken": payload.get("refresh_token", refresh_token),
+            "expiresAt": int(time.time() * 1000) + (expires_in * 1000),
+        }
+    return None
+
+
+def _write_claude_code_credentials_file(creds: Dict[str, Any]) -> None:
+    access_token = _credential_access_token(creds)
+    refresh_token = _credential_refresh_token(creds)
+    if not access_token:
+        return
+    path = Path.home() / ".claude" / ".credentials.json"
+    try:
+        existing: Dict[str, Any] = {}
+        if path.exists():
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict):
+                existing = {}
+    except (OSError, json.JSONDecodeError):
+        existing = {}
+
+    old_oauth = existing.get("claudeAiOauth")
+    old_scopes = old_oauth.get("scopes") if isinstance(old_oauth, dict) else None
+    oauth_data: Dict[str, Any] = {
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "expiresAt": _credential_expires_at_ms(creds),
+    }
+    scopes = creds.get("scopes") if isinstance(creds, dict) else None
+    if isinstance(scopes, list):
+        oauth_data["scopes"] = scopes
+    elif isinstance(old_scopes, list):
+        oauth_data["scopes"] = old_scopes
+
+    existing["claudeAiOauth"] = oauth_data
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+    path.chmod(0o600)
+
+    if platform.system() == "Darwin":
+        try:
+            subprocess.run(
+                [
+                    "security",
+                    "add-generic-password",
+                    "-U",
+                    "-a",
+                    os.environ.get("USER", Path.home().name),
+                    "-s",
+                    "Claude Code-credentials",
+                    "-w",
+                    json.dumps(existing, separators=(",", ":")),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("Could not persist refreshed credentials to Keychain: %s", exc)
+
+
+def _resolve_refreshable_token_locally() -> Optional[str]:
+    creds = _read_local_claude_code_credentials()
+    if _credential_is_valid(creds):
+        return _credential_access_token(creds)
+    refresh_token = _credential_refresh_token(creds)
+    if not refresh_token:
+        return None
+    refreshed = _refresh_anthropic_oauth_token(refresh_token)
+    if not refreshed:
+        return None
+    try:
+        _write_claude_code_credentials_file(refreshed)
+    except OSError as exc:
+        logger.debug("Could not persist refreshed Claude Code credentials: %s", exc)
+    return _credential_access_token(refreshed)
+
+
+def _force_refresh_local_claude_code_credentials() -> Optional[Dict[str, Any]]:
+    """Refresh Claude Code OAuth even when the local expiry still looks valid.
+
+    Anthropic can reject an access token with 401 before ``expiresAt`` catches
+    up, especially after another process rotates the token pair.  Reactive
+    auth recovery must therefore refresh on the server signal, not only on the
+    local timestamp.
+    """
+    creds = _read_local_claude_code_credentials()
+    refresh_token = _credential_refresh_token(creds)
+    if not refresh_token:
+        return None
+    refreshed = _refresh_anthropic_oauth_token(refresh_token)
+    if not refreshed:
+        return None
+    try:
+        _write_claude_code_credentials_file(refreshed)
+    except OSError as exc:
+        logger.debug("Could not persist force-refreshed Claude Code credentials: %s", exc)
+    return refreshed
+
+
+def _resolve_refreshable_token(aa_module: Any) -> Optional[str]:
+    """Resolve the freshest Claude Code OAuth token available.
+
+    New Hermes builds expose this through ``resolve_anthropic_token`` and
+    ``read_claude_code_credentials``.  The local fallback keeps this patch
+    useful on older installations.
+    """
+    reader = getattr(aa_module, "read_claude_code_credentials", None)
+    creds = None
+    if callable(reader):
+        try:
+            creds = reader()
+        except Exception as exc:
+            logger.debug("Hermes read_claude_code_credentials failed: %s", exc)
+    if _credential_is_valid(creds):
+        return _credential_access_token(creds)
+
+    refresh_token = _credential_refresh_token(creds)
+    if refresh_token:
+        refresh_pure = getattr(aa_module, "refresh_anthropic_oauth_pure", None)
+        writer = getattr(aa_module, "_write_claude_code_credentials", None)
+        if callable(refresh_pure):
+            try:
+                refreshed = refresh_pure(refresh_token, use_json=False)
+                access_token = refreshed.get("access_token")
+                if isinstance(access_token, str) and access_token:
+                    if callable(writer):
+                        try:
+                            writer(
+                                access_token,
+                                refreshed.get("refresh_token", refresh_token),
+                                refreshed.get("expires_at_ms", 0),
+                            )
+                        except Exception as exc:
+                            logger.debug("Hermes credential write failed: %s", exc)
+                    return access_token
+            except Exception as exc:
+                logger.debug("Hermes OAuth refresh failed: %s", exc)
+
+    return _resolve_refreshable_token_locally()
+
+
+def _scrub_static_anthropic_env_if_possible(aa_module: Any) -> bool:
+    if not _strict_subscription_mode():
+        return False
+    token = _resolve_refreshable_token(aa_module)
+    if not token:
+        return False
+    removed = False
+    for key in _STATIC_ANTHROPIC_ENV_VARS:
+        if os.environ.get(key):
+            os.environ.pop(key, None)
+            removed = True
+    if removed:
+        sys.stderr.write(
+            "[anthropic_billing_bypass] Ignoring static Anthropic env auth; "
+            "using refreshable Claude Code credentials\n"
+        )
+    return removed
+
+
+def _install_token_resolution_hooks(aa_module: Any) -> bool:
+    any_installed = False
+
+    if not getattr(aa_module, "_CLAUDE_CODE_TOKEN_RESOLVE_PATCHED", False):
+        original_resolve = getattr(aa_module, "resolve_anthropic_token", None)
+        if callable(original_resolve):
+            def patched_resolve_anthropic_token(*args: Any, **kwargs: Any) -> Optional[str]:
+                if _strict_subscription_mode():
+                    fresh = _resolve_refreshable_token(aa_module)
+                    if fresh:
+                        return fresh
+                token = original_resolve(*args, **kwargs)
+                if _is_oauth_like_token(token):
+                    fresh = _resolve_refreshable_token(aa_module)
+                    if fresh:
+                        return fresh
+                return token
+
+            patched_resolve_anthropic_token.__name__ = original_resolve.__name__
+            patched_resolve_anthropic_token.__qualname__ = getattr(
+                original_resolve, "__qualname__", original_resolve.__name__
+            )
+            patched_resolve_anthropic_token.__doc__ = original_resolve.__doc__
+            patched_resolve_anthropic_token.__wrapped__ = original_resolve  # type: ignore[attr-defined]
+            aa_module.resolve_anthropic_token = patched_resolve_anthropic_token
+            aa_module._CLAUDE_CODE_TOKEN_RESOLVE_PATCHED = True  # type: ignore[attr-defined]
+            any_installed = True
+
+    if not getattr(aa_module, "_CLAUDE_CODE_CLIENT_TOKEN_PATCHED", False):
+        original_client = getattr(aa_module, "build_anthropic_client", None)
+        if callable(original_client):
+            def patched_build_anthropic_client(
+                api_key: str,
+                base_url: str = None,
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                effective_key = api_key
+                if _is_direct_anthropic_endpoint(base_url):
+                    fresh = _resolve_refreshable_token(aa_module)
+                    if fresh and (
+                        _strict_subscription_mode()
+                        or not effective_key
+                        or _is_oauth_like_token(effective_key)
+                    ):
+                        if fresh != effective_key:
+                            logger.info(
+                                "Using fresh Claude Code OAuth token for Anthropic client"
+                            )
+                        effective_key = fresh
+                return original_client(effective_key, base_url, *args, **kwargs)
+
+            patched_build_anthropic_client.__name__ = original_client.__name__
+            patched_build_anthropic_client.__qualname__ = getattr(
+                original_client, "__qualname__", original_client.__name__
+            )
+            patched_build_anthropic_client.__doc__ = original_client.__doc__
+            patched_build_anthropic_client.__wrapped__ = original_client  # type: ignore[attr-defined]
+            aa_module.build_anthropic_client = patched_build_anthropic_client
+            aa_module._CLAUDE_CODE_CLIENT_TOKEN_PATCHED = True  # type: ignore[attr-defined]
+            any_installed = True
+
+    if any_installed:
+        sys.stderr.write(
+            "[anthropic_billing_bypass] Token refresh hook installed\n"
+        )
+    return any_installed
+
+
+def _install_credential_pool_401_hook() -> bool:
+    """Patch Hermes credential pools so Claude Code 401 forces token refresh.
+
+    Hermes already refreshes OAuth entries when their local expiry is near, but
+    a rejected access token can still have a future ``expiresAt``.  Without this
+    hook a single-entry ``claude_code`` pool is marked exhausted and the task
+    dies.  On HTTP 401 we force-refresh the Claude Code credential, update the
+    pool entry in-place, and hand it back to the retry loop as the next usable
+    credential.
+    """
+    try:
+        from agent import credential_pool as cp  # type: ignore[import-not-found]
+    except Exception as exc:
+        logger.debug("Cannot import agent.credential_pool for 401 hook: %s", exc)
+        return False
+
+    pool_cls = getattr(cp, "CredentialPool", None)
+    if pool_cls is None or getattr(pool_cls, "_CLAUDE_CODE_401_REFRESH_PATCHED", False):
+        return False
+
+    original_mark = getattr(pool_cls, "mark_exhausted_and_rotate", None)
+    if not callable(original_mark):
+        return False
+
+    status_ok = getattr(cp, "STATUS_OK", "ok")
+
+    def _refresh_current_claude_code_entry(self: Any, status_code: Optional[int]) -> Optional[Any]:
+        if getattr(self, "provider", None) != "anthropic" or status_code != 401:
+            return None
+        entry = None
+        try:
+            entry = self.current() or self._select_unlocked()
+        except Exception as exc:
+            logger.debug("Claude Code 401 hook could not read pool current entry: %s", exc)
+            return None
+        if entry is None or getattr(entry, "source", None) != "claude_code":
+            return None
+
+        refreshed = _force_refresh_local_claude_code_credentials()
+        if not refreshed:
+            return None
+
+        access_token = _credential_access_token(refreshed)
+        refresh_token = _credential_refresh_token(refreshed)
+        if not access_token:
+            return None
+
+        try:
+            updated = replace(
+                entry,
+                access_token=access_token,
+                refresh_token=refresh_token or getattr(entry, "refresh_token", None),
+                expires_at_ms=_credential_expires_at_ms(refreshed),
+                last_status=status_ok,
+                last_status_at=None,
+                last_error_code=None,
+                last_error_reason=None,
+                last_error_message=None,
+                last_error_reset_at=None,
+            )
+            self._replace_entry(entry, updated)
+            self._current_id = getattr(updated, "id", getattr(entry, "id", None))
+            self._persist()
+            logger.info(
+                "credential pool: force-refreshed Claude Code OAuth after 401; retrying same entry"
+            )
+            return updated
+        except Exception as exc:
+            logger.debug("Claude Code 401 hook failed to update pool entry: %s", exc)
+            return None
+
+    def patched_mark_exhausted_and_rotate(
+        self: Any,
+        *,
+        status_code: Optional[int],
+        error_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Any]:
+        if status_code == 401:
+            refreshed_entry = _refresh_current_claude_code_entry(self, status_code)
+            if refreshed_entry is not None:
+                return refreshed_entry
+        return original_mark(
+            self,
+            status_code=status_code,
+            error_context=error_context,
+        )
+
+    patched_mark_exhausted_and_rotate.__name__ = original_mark.__name__
+    patched_mark_exhausted_and_rotate.__qualname__ = getattr(
+        original_mark, "__qualname__", original_mark.__name__
+    )
+    patched_mark_exhausted_and_rotate.__doc__ = original_mark.__doc__
+    patched_mark_exhausted_and_rotate.__wrapped__ = original_mark  # type: ignore[attr-defined]
+    pool_cls.mark_exhausted_and_rotate = patched_mark_exhausted_and_rotate
+    pool_cls._CLAUDE_CODE_401_REFRESH_PATCHED = True  # type: ignore[attr-defined]
+    sys.stderr.write("[anthropic_billing_bypass] Credential pool 401 refresh hook installed\n")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -765,7 +1294,14 @@ def apply_patches(anthropic_adapter_module: Any = None) -> bool:
             return False
 
     if getattr(aa, "_CLAUDE_CODE_BYPASS_APPLIED", False):
+        _scrub_static_anthropic_env_if_possible(aa)
+        _install_token_resolution_hooks(aa)
+        _install_credential_pool_401_hook()
         return True
+
+    _scrub_static_anthropic_env_if_possible(aa)
+    _install_token_resolution_hooks(aa)
+    _install_credential_pool_401_hook()
 
     # 1. Add the OAuth-only beta flags.
     oauth_betas = getattr(aa, "_OAUTH_ONLY_BETAS", None)
